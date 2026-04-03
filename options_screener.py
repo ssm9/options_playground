@@ -1,39 +1,46 @@
 """
 Options screener: finds deep ITM strikes where the near-term ask < far-term bid
 across two consecutive expirations.
+
+Data is sourced via a DataProvider. The default implementation uses yfinance;
+swap it out by passing any object that satisfies the DataProvider interface.
 """
 
 import sys
 from datetime import datetime, timedelta
-import yfinance as yf
 import pandas as pd
 
+from data_provider import DataProvider, YFinanceProvider
 
-def find_deep_itm_opportunities(ticker_symbol: str, itm_pct: float = 0.15) -> pd.DataFrame:
+
+def find_deep_itm_opportunities(
+    ticker_symbol: str,
+    itm_pct: float = 0.15,
+    provider: DataProvider | None = None,
+) -> pd.DataFrame:
     """
     Scans all consecutive expiration pairs for deep ITM options where
     near_term_ask < far_term_bid at the same strike.
 
     Args:
         ticker_symbol: e.g. "SPY", "AAPL"
-        itm_pct: minimum fraction the option must be in-the-money to qualify
-                 as "deep ITM". Default 0.15 = 15% ITM.
+        itm_pct:       minimum fraction the option must be in-the-money to
+                       qualify as "deep ITM". Default 0.15 = 15% ITM.
+        provider:      DataProvider instance to use. Defaults to YFinanceProvider.
 
     Returns:
         DataFrame sorted by (far_bid - near_ask) descending.
     """
-    ticker = yf.Ticker(ticker_symbol)
+    if provider is None:
+        provider = YFinanceProvider()
 
-    try:
-        spot = ticker.fast_info["lastPrice"]
-    except Exception:
-        price_info = ticker.history(period="1d")
-        if price_info.empty:
-            raise ValueError(f"Could not retrieve price for {ticker_symbol!r}")
-        spot = float(price_info["Close"].iloc[-1])
+    spot = provider.get_spot(ticker_symbol)
 
     cutoff = datetime.now() + timedelta(days=30)
-    expirations = [e for e in ticker.options if datetime.strptime(e, "%Y-%m-%d") <= cutoff]
+    expirations = [
+        e for e in provider.get_expirations(ticker_symbol)
+        if datetime.strptime(e, "%Y-%m-%d") <= cutoff
+    ]
     if len(expirations) < 2:
         print(f"Fewer than 2 expirations available for {ticker_symbol}")
         return pd.DataFrame()
@@ -47,19 +54,18 @@ def find_deep_itm_opportunities(ticker_symbol: str, itm_pct: float = 0.15) -> pd
         exp_far = expirations[i + 1]
 
         try:
-            chain_near = ticker.option_chain(exp_near)
-            chain_far = ticker.option_chain(exp_far)
+            calls_near, puts_near = provider.get_option_chain(ticker_symbol, exp_near)
+            calls_far, puts_far = provider.get_option_chain(ticker_symbol, exp_far)
         except Exception as e:
             print(f"  Skipping {exp_near}/{exp_far}: {e}")
             continue
 
-        for option_type in ("call", "put"):
-            near_df = chain_near.calls if option_type == "call" else chain_near.puts
-            far_df = chain_far.calls if option_type == "call" else chain_far.puts
+        chains = {
+            "call": (calls_near, calls_far),
+            "put":  (puts_near,  puts_far),
+        }
 
-            near_df = near_df[["strike", "bid", "ask"]].copy()
-            far_df = far_df[["strike", "bid", "ask"]].copy()
-
+        for option_type, (near_df, far_df) in chains.items():
             # Deep ITM filter:
             #   calls: strike is well below spot  → strike <= spot * (1 - itm_pct)
             #   puts:  strike is well above spot  → strike >= spot * (1 + itm_pct)
@@ -72,14 +78,11 @@ def find_deep_itm_opportunities(ticker_symbol: str, itm_pct: float = 0.15) -> pd
             if near_deep.empty:
                 continue
 
-            # Merge on strike to find common strikes between the two expirations
+            # Merge on strike to find common strikes across both expirations
             merged = near_deep.merge(far_df, on="strike", suffixes=("_near", "_far"))
 
             # Require valid (non-zero) quotes on both sides
-            merged = merged[
-                (merged["ask_near"] > 0) &
-                (merged["bid_far"] > 0)
-            ]
+            merged = merged[(merged["ask_near"] > 0) & (merged["bid_far"] > 0)]
 
             # Core condition: near ask < far bid
             hits = merged[merged["ask_near"] < merged["bid_far"]].copy()
@@ -89,7 +92,7 @@ def find_deep_itm_opportunities(ticker_symbol: str, itm_pct: float = 0.15) -> pd
             hits["type"] = option_type
             hits["exp_near"] = exp_near
             hits["exp_far"] = exp_far
-            hits["credit"] = hits["bid_far"] - hits["ask_near"]  # net credit if traded
+            hits["credit"] = hits["bid_far"] - hits["ask_near"]
             hits["spot"] = spot
 
             results.append(hits[["type", "strike", "exp_near", "exp_far",
@@ -99,8 +102,7 @@ def find_deep_itm_opportunities(ticker_symbol: str, itm_pct: float = 0.15) -> pd
         return pd.DataFrame()
 
     out = pd.concat(results, ignore_index=True)
-    out = out.sort_values("credit", ascending=False).reset_index(drop=True)
-    return out
+    return out.sort_values("credit", ascending=False).reset_index(drop=True)
 
 
 def main():
